@@ -93,6 +93,7 @@ services:
       - /usr/local/bin/cfwarp-route-manager
     environment:
       CFWARP_CONTAINER_IPV4: ${CFWARP_CONTAINER_IPV4:-172.30.0.2}
+      CFWARP_BRIDGE_NAME: ${CFWARP_BRIDGE_NAME:-cfwarp0}
       CFWARP_REMOTE_IPV4_CIDRS: ${CFWARP_REMOTE_IPV4_CIDRS:-100.96.0.0/12}
       CFWARP_ROUTE_INTERVAL: ${CFWARP_ROUTE_INTERVAL:-30s}
       CFWARP_MANAGE_DOCKER_USER_RULES: ${CFWARP_MANAGE_DOCKER_USER_RULES:-true}
@@ -140,7 +141,7 @@ docker compose exec cfwarp warp-cli status
 
 `./data/cloudflare-warp` 是持久化状态目录。保留它可以让容器重启或镜像升级后复用同一个 Mesh node 注册状态，不重复注册新节点。
 
-默认配置不会让 WARP 客户端进入宿主机网络命名空间。`cfwarp` 容器只在自己的网络命名空间中启用 forwarding；`cfwarp-route-manager` 只在宿主机上维护到远端 Mesh 地址段的路由，不修改宿主机防火墙。
+默认配置不会让 WARP 客户端进入宿主机网络命名空间。`cfwarp` 容器只在自己的网络命名空间中启用 forwarding；`cfwarp-route-manager` 只在宿主机上维护到远端 Mesh 地址段的路由，并在退出时清理自己维护的宿主机路由和 Docker 转发放行规则。
 
 ## 运行
 

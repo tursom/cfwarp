@@ -2,9 +2,13 @@
 set -Eeuo pipefail
 
 CFWARP_CONTAINER_IPV4="${CFWARP_CONTAINER_IPV4:-172.30.0.2}"
+CFWARP_BRIDGE_NAME="${CFWARP_BRIDGE_NAME:-cfwarp0}"
 CFWARP_REMOTE_IPV4_CIDRS="${CFWARP_REMOTE_IPV4_CIDRS:-100.96.0.0/12}"
 CFWARP_ROUTE_INTERVAL="${CFWARP_ROUTE_INTERVAL:-30s}"
 CFWARP_MANAGE_DOCKER_USER_RULES="${CFWARP_MANAGE_DOCKER_USER_RULES:-true}"
+MANAGED_BRIDGE_IF=""
+SLEEP_PID=""
+SHUTDOWN_REQUESTED=false
 
 log() {
   printf '[cfwarp-route] %s\n' "$*"
@@ -43,8 +47,26 @@ sync_routes() {
   done
 }
 
+cleanup_routes() {
+  local cidr
+
+  for cidr in ${CFWARP_REMOTE_IPV4_CIDRS//,/ }; do
+    if ip route show "${cidr}" | grep -Fq "via ${CFWARP_CONTAINER_IPV4}"; then
+      ip route del "${cidr}" via "${CFWARP_CONTAINER_IPV4}" 2>/dev/null || true
+      log "Removed route ${cidr} via ${CFWARP_CONTAINER_IPV4}"
+    fi
+  done
+}
+
 bridge_interface() {
-  ip route get "${CFWARP_CONTAINER_IPV4}" \
+  local route
+
+  route="$(ip route get "${CFWARP_CONTAINER_IPV4}" 2>/dev/null || true)"
+  if [[ -z "${route}" || "${route}" == *" via "* ]]; then
+    return 0
+  fi
+
+  printf '%s\n' "${route}" \
     | sed -n 's/.* dev \([^ ]*\).*/\1/p' \
     | head -n 1
 }
@@ -88,6 +110,7 @@ sync_docker_user_rules() {
     log "Cannot resolve bridge interface for ${CFWARP_CONTAINER_IPV4}; skipping Docker bridge firewall rules"
     return
   fi
+  MANAGED_BRIDGE_IF="${bridge_if}"
 
   for cidr in ${CFWARP_REMOTE_IPV4_CIDRS//,/ }; do
     insert_docker_user_rule \
@@ -96,15 +119,95 @@ sync_docker_user_rules() {
   done
 }
 
+delete_docker_user_rule() {
+  local bridge_if="$1"
+  local cidr="$2"
+  local handle
+
+  if [[ -z "${bridge_if}" ]] || ! nft_chain_exists; then
+    return
+  fi
+
+  while read -r handle; do
+    if [[ -n "${handle}" ]]; then
+      nft delete rule ip filter DOCKER-USER handle "${handle}" 2>/dev/null || true
+      log "Removed DOCKER-USER rule: oifname \"${bridge_if}\" ip daddr ${cidr} accept"
+    fi
+  done < <(
+    nft --handle list chain ip filter DOCKER-USER 2>/dev/null \
+      | awk -v bridge_if="${bridge_if}" -v cidr="${cidr}" '
+          index($0, "oifname \"" bridge_if "\"") &&
+          index($0, "ip daddr " cidr) &&
+          index($0, "accept") &&
+          match($0, /# handle [0-9]+/) {
+            print $NF
+          }'
+  )
+}
+
+cleanup_docker_user_rules() {
+  local bridge_if
+  local cidr
+  local detected_bridge_if
+  local bridge_ifs=()
+
+  if [[ "${CFWARP_MANAGE_DOCKER_USER_RULES}" != "true" ]]; then
+    return
+  fi
+
+  detected_bridge_if="$(bridge_interface)"
+  bridge_ifs=("${MANAGED_BRIDGE_IF}" "${detected_bridge_if}" "${CFWARP_BRIDGE_NAME}")
+
+  for bridge_if in "${bridge_ifs[@]}"; do
+    [[ -n "${bridge_if}" ]] || continue
+
+    for cidr in ${CFWARP_REMOTE_IPV4_CIDRS//,/ }; do
+      delete_docker_user_rule "${bridge_if}" "${cidr}"
+    done
+  done
+}
+
+cleanup() {
+  local exit_code=$?
+
+  trap - EXIT INT TERM
+  set +e
+  log "Cleaning up managed host routes and Docker rules"
+  cleanup_routes
+  cleanup_docker_user_rules
+  exit "${exit_code}"
+}
+
+request_shutdown() {
+  SHUTDOWN_REQUESTED=true
+
+  if [[ -n "${SLEEP_PID}" ]]; then
+    kill "${SLEEP_PID}" 2>/dev/null || true
+  fi
+}
+
+wait_for_next_sync() {
+  SLEEP_PID=""
+  sleep "${CFWARP_ROUTE_INTERVAL}" &
+  SLEEP_PID="$!"
+  wait "${SLEEP_PID}" || true
+  SLEEP_PID=""
+}
+
 main() {
   validate_config
+  trap cleanup EXIT
+  trap request_shutdown INT TERM
+
   log "Managing IPv4 routes for ${CFWARP_REMOTE_IPV4_CIDRS} via ${CFWARP_CONTAINER_IPV4}"
 
-  while true; do
+  while [[ "${SHUTDOWN_REQUESTED}" != "true" ]]; do
     sync_routes
     sync_docker_user_rules
-    sleep "${CFWARP_ROUTE_INTERVAL}"
+    wait_for_next_sync
   done
+
+  exit 0
 }
 
 main "$@"
