@@ -8,7 +8,8 @@
 
 - 支持 Docker Compose 的 Docker 环境。
 - Linux 宿主机存在 `/dev/net/tun`。
-- 允许容器使用 `network_mode: host` 和 `NET_ADMIN` 权限。
+- 允许容器使用 `network_mode: host`。
+- 默认自动启用宿主机 forwarding 时，需要 `privileged: true`；如果宿主机已手动配置 sysctl，可以关闭自动 forwarding 后只保留 `NET_ADMIN`。
 - 已启用 Cloudflare Mesh 的 Cloudflare Zero Trust 账号。
 - 已在 Cloudflare Dashboard 中创建 Mesh connector token。
 
@@ -61,6 +62,7 @@ services:
       CFWARP_ENABLE_FORWARDING: ${CFWARP_ENABLE_FORWARDING:-true}
       CFWARP_WARP_MODE: ${CFWARP_WARP_MODE:-warp}
       CFWARP_HEALTHCHECK_INTERVAL: ${CFWARP_HEALTHCHECK_INTERVAL:-30s}
+    privileged: true
     cap_add:
       - NET_ADMIN
     devices:
@@ -92,6 +94,20 @@ docker compose exec cfwarp warp-cli status
 ```
 
 `./data/cloudflare-warp` 是持久化状态目录。保留它可以让容器重启或镜像升级后复用同一个 Mesh node 注册状态，不重复注册新节点。
+
+默认配置会在容器启动时修改宿主机网络命名空间中的 forwarding sysctl，因此示例里启用了 `privileged: true`。如果你不希望容器拥有 privileged 权限，也可以先在宿主机上手动执行：
+
+```sh
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1
+sysctl -w net.ipv6.conf.all.accept_ra=2
+```
+
+然后在 `.env` 中设置：
+
+```env
+CFWARP_ENABLE_FORWARDING=false
+```
 
 ## 运行
 
@@ -168,6 +184,11 @@ sysctl -w net.ipv6.conf.all.accept_ra=2
 ```sh
 --device /dev/net/tun --cap-add NET_ADMIN --network host
 ```
+
+如果日志中出现 `sysctl: permission denied on key "net.ipv4.ip_forward"`，说明容器没有权限修改宿主机网络 sysctl。处理方式二选一：
+
+- 在 Compose 服务中添加 `privileged: true`，然后执行 `docker compose up -d --force-recreate`。
+- 在宿主机上手动设置 forwarding，并把 `.env` 中的 `CFWARP_ENABLE_FORWARDING` 改为 `false`。
 
 如果 Mesh node 没有上线，请检查：
 

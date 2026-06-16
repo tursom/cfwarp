@@ -11,6 +11,7 @@ services:
       CFWARP_ENABLE_FORWARDING: ${CFWARP_ENABLE_FORWARDING:-true}
       CFWARP_WARP_MODE: ${CFWARP_WARP_MODE:-warp}
       CFWARP_HEALTHCHECK_INTERVAL: ${CFWARP_HEALTHCHECK_INTERVAL:-30s}
+    privileged: true
     cap_add:
       - NET_ADMIN
     devices:

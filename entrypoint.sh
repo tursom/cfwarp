@@ -59,10 +59,22 @@ set_sysctl_if_present() {
   local key="$1"
   local value="$2"
   local path="/proc/sys/${key//./\/}"
+  local current
+  local output
 
   if [[ -e "${path}" ]]; then
-    sysctl -w "${key}=${value}" >/dev/null
-    log "Set ${key}=${value}"
+    current="$(cat "${path}" 2>/dev/null || true)"
+    if [[ "${current}" == "${value}" ]]; then
+      log "${key} is already ${value}"
+      return
+    fi
+
+    if output="$(sysctl -w "${key}=${value}" 2>&1)"; then
+      log "Set ${key}=${value}"
+    else
+      log "Failed to set ${key}=${value}: ${output}"
+      die "Forwarding auto-enable needs permission to write host network sysctls. Run with privileged: true, or set host sysctls manually and set CFWARP_ENABLE_FORWARDING=false."
+    fi
   else
     log "Skipped ${key}; ${path} does not exist in this network namespace"
   fi
