@@ -1,0 +1,19 @@
+services:
+  cfwarp:
+    build:
+      context: .
+    image: cfwarp:local
+    container_name: cfwarp
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      CFWARP_CONNECTOR_TOKEN: ${CFWARP_CONNECTOR_TOKEN:-}
+      CFWARP_ENABLE_FORWARDING: ${CFWARP_ENABLE_FORWARDING:-true}
+      CFWARP_WARP_MODE: ${CFWARP_WARP_MODE:-warp}
+      CFWARP_HEALTHCHECK_INTERVAL: ${CFWARP_HEALTHCHECK_INTERVAL:-30s}
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./data/cloudflare-warp:/var/lib/cloudflare-warp
