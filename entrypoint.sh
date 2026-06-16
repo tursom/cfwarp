@@ -95,9 +95,14 @@ enable_forwarding() {
 }
 
 start_warp_service() {
+  rm -f "${WARP_IPC_SOCKET}"
   log "Starting warp-svc"
   warp-svc &
   WARP_SVC_PID="$!"
+}
+
+warp_cli() {
+  warp-cli --accept-tos "$@"
 }
 
 wait_for_warp_cli() {
@@ -106,7 +111,7 @@ wait_for_warp_cli() {
   local status_output
 
   while (( attempt <= max_attempts )); do
-    if status_output="$(warp-cli status 2>&1)"; then
+    if status_output="$(warp_cli status 2>&1)"; then
       printf '%s\n' "${status_output}" >/tmp/cfwarp-status.out
       log "warp-cli is ready"
       return 0
@@ -118,7 +123,7 @@ wait_for_warp_cli() {
       return 0
     fi
 
-    if [[ -S "${WARP_IPC_SOCKET}" ]]; then
+    if [[ -S "${WARP_IPC_SOCKET}" ]] && ! grep -Eiq "${WARP_CLI_NOT_READY_RE}" <<<"${status_output}"; then
       log "warp-cli IPC socket is ready"
       return 0
     fi
@@ -152,7 +157,7 @@ warp_cli_status_indicates_ready() {
 }
 
 status_text() {
-  warp-cli status 2>&1 || true
+  warp_cli status 2>&1 || true
 }
 
 is_registered() {
@@ -163,7 +168,11 @@ is_registered() {
     return 1
   fi
 
-  if grep -Eiq 'connected|connecting|disconnected|connection' <<<"${status}"; then
+  if grep -Eiq "${WARP_CLI_NOT_READY_RE}" <<<"${status}"; then
+    return 1
+  fi
+
+  if grep -Eiq 'connected|connecting|disconnected' <<<"${status}"; then
     return 0
   fi
 
@@ -179,19 +188,19 @@ ensure_registered() {
   [[ -n "${CFWARP_CONNECTOR_TOKEN:-}" ]] || die "CFWARP_CONNECTOR_TOKEN is required for first-time Mesh connector registration"
 
   log "Registering Mesh connector"
-  warp-cli connector new "${CFWARP_CONNECTOR_TOKEN}"
+  warp_cli connector new "${CFWARP_CONNECTOR_TOKEN}"
 }
 
 configure_warp() {
   if [[ -n "${CFWARP_WARP_MODE}" ]]; then
     log "Setting WARP mode to ${CFWARP_WARP_MODE}"
-    warp-cli mode "${CFWARP_WARP_MODE}"
+    warp_cli mode "${CFWARP_WARP_MODE}"
   fi
 }
 
 connect_warp() {
   log "Connecting WARP"
-  warp-cli connect
+  warp_cli connect
 }
 
 is_connected() {
@@ -212,7 +221,7 @@ health_loop() {
 
     if ! is_connected; then
       log "WARP is not connected; retrying connect"
-      warp-cli connect || true
+      warp_cli connect || true
     fi
 
     sleep "${CFWARP_HEALTHCHECK_INTERVAL}"
