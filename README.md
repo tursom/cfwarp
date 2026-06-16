@@ -8,8 +8,8 @@
 
 - 支持 Docker Compose 的 Docker 环境。
 - Linux 宿主机存在 `/dev/net/tun`。
-- 允许容器使用 `network_mode: host`。
-- 默认自动启用宿主机 forwarding 时，需要 `privileged: true`；如果宿主机已手动配置 sysctl，可以关闭自动 forwarding 后只保留 `NET_ADMIN`。
+- 允许 `cfwarp` 容器使用 `NET_ADMIN` 和 `/dev/net/tun`。
+- 允许 `cfwarp-route-manager` sidecar 使用宿主机网络和 `NET_ADMIN`，用于维护宿主机到 WARP 容器的路由。
 - 已启用 Cloudflare Mesh 的 Cloudflare Zero Trust 账号。
 - 已在 Cloudflare Dashboard 中创建 Mesh connector token。
 
@@ -17,7 +17,7 @@
 
 先在 Cloudflare Dashboard 中创建 Mesh node，然后复制它的 connector token。容器只消费这个 token，不会创建 Mesh node、route 或其他 Cloudflare API 资源。
 
-如果要使用子网路由，需要在 Cloudflare Mesh 中配置目标 CIDR route。容器侧只负责让 WARP connector 在线，并按配置启用宿主机网络命名空间里的 forwarding。
+如果要使用子网路由，需要在 Cloudflare Mesh 中配置目标 CIDR route。默认部署会把 WARP 客户端隔离在 Docker bridge 网络里，WARP 创建的防火墙和策略路由只影响 `cfwarp` 容器，不接管宿主机网络。
 
 Cloudflare 官方参考文档：
 
@@ -42,9 +42,16 @@ CFWARP_CONNECTOR_TOKEN=your-cloudflare-mesh-connector-token
 
 可选配置：
 
-- `CFWARP_ENABLE_FORWARDING`：默认 `true`，自动启用宿主机网络命名空间里的 IPv4/IPv6 forwarding。
-- `CFWARP_WARP_MODE`：默认 `warp`，用于执行 `warp-cli mode`。
+- `CFWARP_ENABLE_FORWARDING`：默认 `true`，自动启用 `cfwarp` 容器网络命名空间里的 IPv4 forwarding。
+- `CFWARP_ENABLE_IPV6_FORWARDING`：默认 `false`。如果需要实验性 IPv6 Mesh 路由，可改为 `true`，但 Docker bridge 环境不一定允许容器修改 IPv6 forwarding。
+- `CFWARP_WARP_MODE`：默认留空，不覆盖 Cloudflare Zero Trust 策略下发的模式。仅当策略允许本地切换模式时才设置该值。
 - `CFWARP_HEALTHCHECK_INTERVAL`：默认 `30s`，用于状态检查循环和日志输出节流。
+- `CFWARP_BRIDGE_NAME`：默认 `cfwarp0`，`cfwarp` 专用 Docker bridge 在宿主机上的网卡名。
+- `CFWARP_BRIDGE_SUBNET`：默认 `172.30.0.0/24`，`cfwarp` 专用 Docker bridge 网段。
+- `CFWARP_CONTAINER_IPV4`：默认 `172.30.0.2`，`cfwarp` 容器固定 IPv4 地址。
+- `CFWARP_REMOTE_IPV4_CIDRS`：默认 `100.96.0.0/12`，远端 Mesh IPv4 地址段。route-manager 会在宿主机上把这些 CIDR 路由到 `cfwarp` 容器，`cfwarp` 容器内会把这些 CIDR 路由到 `CloudflareWARP`。多个 CIDR 可用逗号或空格分隔。
+- `CFWARP_ROUTE_INTERVAL`：默认 `30s`，route-manager 刷新宿主机路由的间隔。
+- `CFWARP_MANAGE_DOCKER_USER_RULES`：默认 `true`，route-manager 会在 Docker 的 `DOCKER-USER` 链放行发往远端 Mesh CIDR 的转发包。
 
 ## Docker Compose 部署
 
@@ -55,20 +62,51 @@ services:
   cfwarp:
     image: ghcr.io/tursom/cfwarp:latest
     container_name: cfwarp
-    network_mode: host
     restart: unless-stopped
     environment:
       CFWARP_CONNECTOR_TOKEN: ${CFWARP_CONNECTOR_TOKEN:-}
       CFWARP_ENABLE_FORWARDING: ${CFWARP_ENABLE_FORWARDING:-true}
-      CFWARP_WARP_MODE: ${CFWARP_WARP_MODE:-warp}
+      CFWARP_ENABLE_IPV6_FORWARDING: ${CFWARP_ENABLE_IPV6_FORWARDING:-false}
+      CFWARP_WARP_MODE: ${CFWARP_WARP_MODE:-}
       CFWARP_HEALTHCHECK_INTERVAL: ${CFWARP_HEALTHCHECK_INTERVAL:-30s}
-    privileged: true
+      CFWARP_REMOTE_IPV4_CIDRS: ${CFWARP_REMOTE_IPV4_CIDRS:-100.96.0.0/12}
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
     volumes:
       - ./data/cloudflare-warp:/var/lib/cloudflare-warp
+    networks:
+      cfwarp_net:
+        ipv4_address: ${CFWARP_CONTAINER_IPV4:-172.30.0.2}
+
+  cfwarp-route-manager:
+    image: ghcr.io/tursom/cfwarp:latest
+    container_name: cfwarp-route-manager
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - cfwarp
+    entrypoint:
+      - /usr/bin/tini
+      - --
+      - /usr/local/bin/cfwarp-route-manager
+    environment:
+      CFWARP_CONTAINER_IPV4: ${CFWARP_CONTAINER_IPV4:-172.30.0.2}
+      CFWARP_REMOTE_IPV4_CIDRS: ${CFWARP_REMOTE_IPV4_CIDRS:-100.96.0.0/12}
+      CFWARP_ROUTE_INTERVAL: ${CFWARP_ROUTE_INTERVAL:-30s}
+      CFWARP_MANAGE_DOCKER_USER_RULES: ${CFWARP_MANAGE_DOCKER_USER_RULES:-true}
+    cap_add:
+      - NET_ADMIN
+
+networks:
+  cfwarp_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: ${CFWARP_BRIDGE_NAME:-cfwarp0}
+    ipam:
+      config:
+        - subnet: ${CFWARP_BRIDGE_SUBNET:-172.30.0.0/24}
 ```
 
 同目录创建 `.env`：
@@ -76,8 +114,15 @@ services:
 ```env
 CFWARP_CONNECTOR_TOKEN=your-cloudflare-mesh-connector-token
 CFWARP_ENABLE_FORWARDING=true
-CFWARP_WARP_MODE=warp
+CFWARP_ENABLE_IPV6_FORWARDING=false
+CFWARP_WARP_MODE=
 CFWARP_HEALTHCHECK_INTERVAL=30s
+CFWARP_BRIDGE_NAME=cfwarp0
+CFWARP_BRIDGE_SUBNET=172.30.0.0/24
+CFWARP_CONTAINER_IPV4=172.30.0.2
+CFWARP_REMOTE_IPV4_CIDRS=100.96.0.0/12
+CFWARP_ROUTE_INTERVAL=30s
+CFWARP_MANAGE_DOCKER_USER_RULES=true
 ```
 
 启动服务：
@@ -95,19 +140,7 @@ docker compose exec cfwarp warp-cli status
 
 `./data/cloudflare-warp` 是持久化状态目录。保留它可以让容器重启或镜像升级后复用同一个 Mesh node 注册状态，不重复注册新节点。
 
-默认配置会在容器启动时修改宿主机网络命名空间中的 forwarding sysctl，因此示例里启用了 `privileged: true`。如果你不希望容器拥有 privileged 权限，也可以先在宿主机上手动执行：
-
-```sh
-sysctl -w net.ipv4.ip_forward=1
-sysctl -w net.ipv6.conf.all.forwarding=1
-sysctl -w net.ipv6.conf.all.accept_ra=2
-```
-
-然后在 `.env` 中设置：
-
-```env
-CFWARP_ENABLE_FORWARDING=false
-```
+默认配置不会让 WARP 客户端进入宿主机网络命名空间。`cfwarp` 容器只在自己的网络命名空间中启用 forwarding；`cfwarp-route-manager` 只在宿主机上维护到远端 Mesh 地址段的路由，不修改宿主机防火墙。
 
 ## 运行
 
@@ -159,21 +192,41 @@ docker pull ghcr.io/tursom/cfwarp:latest
 
 ## 网络行为
 
-默认 Compose 配置使用宿主机网络：
+默认 Compose 配置使用专用 Docker bridge 网络：
 
 ```yaml
-network_mode: host
+networks:
+  cfwarp_net:
+    driver_opts:
+      com.docker.network.bridge.name: cfwarp0
+    ipv4_address: 172.30.0.2
 ```
 
-当 `CFWARP_ENABLE_FORWARDING=true` 时，entrypoint 会在宿主机网络命名空间中执行以下 sysctl 设置：
+WARP 客户端在 `cfwarp` 容器里创建 `CloudflareWARP` 接口、nftables 规则和策略路由。由于 `cfwarp` 不使用 `network_mode: host`，这些规则不会出现在宿主机网络命名空间，也不会接管宿主机 22 端口。
+
+当 `CFWARP_ENABLE_FORWARDING=true` 时，entrypoint 会在 `cfwarp` 容器网络命名空间中执行以下 sysctl 设置：
 
 ```sh
 sysctl -w net.ipv4.ip_forward=1
-sysctl -w net.ipv6.conf.all.forwarding=1
-sysctl -w net.ipv6.conf.all.accept_ra=2
 ```
 
-这是为了支持子网路由场景而设计的行为。如果希望自行管理 forwarding，请设置 `CFWARP_ENABLE_FORWARDING=false`。
+这是为了支持 IPv4 Mesh 转发场景而设计的行为。如果希望自行管理容器内 forwarding，请设置 `CFWARP_ENABLE_FORWARDING=false`。IPv6 forwarding 默认不启用；需要时设置 `CFWARP_ENABLE_IPV6_FORWARDING=true`。
+
+`cfwarp-route-manager` 会在宿主机网络命名空间中维护以下路由：
+
+```sh
+ip route replace 100.96.0.0/12 via 172.30.0.2
+```
+
+`cfwarp` 容器内也会维护对应路由，把同一个远端 Mesh CIDR 送入 WARP 接口：
+
+```sh
+ip route replace 100.96.0.0/12 dev CloudflareWARP
+```
+
+它还会在 Docker 的 `DOCKER-USER` 链放行发往该远端 Mesh CIDR 的转发包。Docker bridge 默认会拦截从宿主机转发进容器网段的包；这条规则只打通纯路由回程，不修改 WARP 自己创建的防火墙。
+
+这是纯路由不 NAT 方案。被访问的 LAN 默认网关或目标主机必须有回程路由，把 `100.96.0.0/12` 指向 Docker 宿主机，否则请求可以到达目标网段但响应无法回到 Mesh。
 
 ## 故障排查
 
@@ -182,13 +235,14 @@ sysctl -w net.ipv6.conf.all.accept_ra=2
 如果提示 `/dev/net/tun is missing`，请使用本仓库提供的 Compose 文件运行，或在手动运行容器时添加：
 
 ```sh
---device /dev/net/tun --cap-add NET_ADMIN --network host
+--device /dev/net/tun --cap-add NET_ADMIN
 ```
 
-如果日志中出现 `sysctl: permission denied on key "net.ipv4.ip_forward"`，说明容器没有权限修改宿主机网络 sysctl。处理方式二选一：
+如果日志中出现 `sysctl: permission denied on key "net.ipv4.ip_forward"`，说明 `cfwarp` 容器没有权限修改容器网络命名空间里的 forwarding sysctl。请确认 `cfwarp` 服务保留了 `cap_add: [NET_ADMIN]`，或设置 `CFWARP_ENABLE_FORWARDING=false` 后自行管理 forwarding。
 
-- 在 Compose 服务中添加 `privileged: true`，然后执行 `docker compose up -d --force-recreate`。
-- 在宿主机上手动设置 forwarding，并把 `.env` 中的 `CFWARP_ENABLE_FORWARDING` 改为 `false`。
+如果日志中出现 `Operation not authorized in this context` 且发生在 `warp-cli mode` 后，说明 Zero Trust 策略不允许客户端本地切换模式。请保持 `CFWARP_WARP_MODE` 为空，让客户端使用策略下发的模式。
+
+如果宿主机 22 端口或其他公网 TCP 端口在 WARP 连接后不可访问，通常说明仍在使用旧的 `network_mode: host` 部署。请切换到默认 bridge 部署，并确认宿主机上不再出现由当前容器创建的 `CloudflareWARP` 接口、`cloudflare-warp` nftables 表或 `lookup 65743` 策略路由。
 
 如果 Mesh node 没有上线，请检查：
 
@@ -200,5 +254,6 @@ sysctl -w net.ipv6.conf.all.accept_ra=2
 如果节点已经在线但子网路由不通，请检查：
 
 - Cloudflare Mesh 中已经配置 route，并且 route 指向这个节点。
-- 宿主机防火墙允许 WARP 接口和本地网络之间转发流量。
-- 本地网络有回程路由指向这台宿主机，或者宿主机在容器外自行完成 NAT。
+- `cfwarp-route-manager` 日志显示已经维护 `CFWARP_REMOTE_IPV4_CIDRS` 到 `CFWARP_CONTAINER_IPV4` 的宿主机路由。
+- Docker `DOCKER-USER` 链已放行发往 `CFWARP_REMOTE_IPV4_CIDRS` 的转发包，或已设置 `CFWARP_MANAGE_DOCKER_USER_RULES=true`。
+- 本地网络有回程路由把 `CFWARP_REMOTE_IPV4_CIDRS` 指向这台 Docker 宿主机。

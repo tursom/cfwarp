@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-CFWARP_WARP_MODE="${CFWARP_WARP_MODE:-warp}"
+CFWARP_WARP_MODE="${CFWARP_WARP_MODE:-}"
 CFWARP_ENABLE_FORWARDING="${CFWARP_ENABLE_FORWARDING:-true}"
+CFWARP_ENABLE_IPV6_FORWARDING="${CFWARP_ENABLE_IPV6_FORWARDING:-false}"
 CFWARP_HEALTHCHECK_INTERVAL="${CFWARP_HEALTHCHECK_INTERVAL:-30s}"
+CFWARP_REMOTE_IPV4_CIDRS="${CFWARP_REMOTE_IPV4_CIDRS:-100.96.0.0/12}"
 
 WARP_SVC_PID=""
 WARP_IPC_SOCKET="/run/cloudflare-warp/warp_service"
@@ -76,7 +78,7 @@ set_sysctl_if_present() {
       log "Set ${key}=${value}"
     else
       log "Failed to set ${key}=${value}: ${output}"
-      die "Forwarding auto-enable needs permission to write host network sysctls. Run with privileged: true, or set host sysctls manually and set CFWARP_ENABLE_FORWARDING=false."
+      die "Forwarding auto-enable needs permission to write this network namespace's sysctls. Keep NET_ADMIN on cfwarp, or set CFWARP_ENABLE_FORWARDING=false and manage forwarding yourself."
     fi
   else
     log "Skipped ${key}; ${path} does not exist in this network namespace"
@@ -90,8 +92,38 @@ enable_forwarding() {
   fi
 
   set_sysctl_if_present net.ipv4.ip_forward 1
-  set_sysctl_if_present net.ipv6.conf.all.forwarding 1
-  set_sysctl_if_present net.ipv6.conf.all.accept_ra 2
+  if is_true "${CFWARP_ENABLE_IPV6_FORWARDING}"; then
+    set_sysctl_if_present net.ipv6.conf.all.forwarding 1
+    set_sysctl_if_present net.ipv6.conf.all.accept_ra 2
+  else
+    log "IPv6 forwarding auto-enable disabled by CFWARP_ENABLE_IPV6_FORWARDING=${CFWARP_ENABLE_IPV6_FORWARDING}"
+  fi
+}
+
+sync_remote_mesh_routes() {
+  local cidr
+
+  if [[ -z "${CFWARP_REMOTE_IPV4_CIDRS//[[:space:],]/}" ]]; then
+    log "Remote Mesh IPv4 route management disabled"
+    return
+  fi
+
+  if ! ip link show CloudflareWARP >/dev/null 2>&1; then
+    log "CloudflareWARP interface is not ready; skipping remote Mesh route sync"
+    return
+  fi
+
+  for cidr in ${CFWARP_REMOTE_IPV4_CIDRS//,/ }; do
+    if [[ ! "${cidr}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+      log "Skipping invalid remote Mesh IPv4 CIDR: ${cidr}"
+      continue
+    fi
+
+    if ! ip route show "${cidr}" | grep -Fq "${cidr} dev CloudflareWARP"; then
+      ip route replace "${cidr}" dev CloudflareWARP
+      log "Route remote Mesh CIDR ${cidr} through CloudflareWARP"
+    fi
+  done
 }
 
 start_warp_service() {
@@ -194,7 +226,11 @@ ensure_registered() {
 configure_warp() {
   if [[ -n "${CFWARP_WARP_MODE}" ]]; then
     log "Setting WARP mode to ${CFWARP_WARP_MODE}"
-    warp_cli mode "${CFWARP_WARP_MODE}"
+    if ! warp_cli mode "${CFWARP_WARP_MODE}"; then
+      log "Unable to set WARP mode to ${CFWARP_WARP_MODE}; continuing with the mode allowed by the Cloudflare policy"
+    fi
+  else
+    log "Skipping WARP mode override"
   fi
 }
 
@@ -206,7 +242,7 @@ connect_warp() {
 is_connected() {
   local status
   status="$(status_text)"
-  grep -Eiq 'status:[[:space:]]*connected|connected' <<<"${status}"
+  grep -Eiq '^Status( update)?:[[:space:]]*Connected([[:space:]]|$)' <<<"${status}"
 }
 
 health_loop() {
@@ -224,6 +260,8 @@ health_loop() {
       warp_cli connect || true
     fi
 
+    sync_remote_mesh_routes
+
     sleep "${CFWARP_HEALTHCHECK_INTERVAL}"
   done
 }
@@ -237,6 +275,7 @@ main() {
   ensure_registered
   configure_warp
   connect_warp
+  sync_remote_mesh_routes
   health_loop
 }
 

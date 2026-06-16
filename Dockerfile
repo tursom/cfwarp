@@ -16,6 +16,7 @@ RUN set -eux; \
         gnupg \
         iproute2 \
         lsb-release \
+        nftables \
         procps \
         tini; \
     mkdir -p /usr/share/keyrings; \
@@ -31,8 +32,10 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY entrypoint.sh /usr/local/bin/cfwarp-entrypoint
+COPY route-manager.sh /usr/local/bin/cfwarp-route-manager
 
 RUN chmod +x /usr/local/bin/cfwarp-entrypoint \
+    && chmod +x /usr/local/bin/cfwarp-route-manager \
     && mkdir -p /var/lib/cloudflare-warp
 
 VOLUME ["/var/lib/cloudflare-warp"]
