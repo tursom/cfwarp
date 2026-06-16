@@ -6,6 +6,9 @@ CFWARP_ENABLE_FORWARDING="${CFWARP_ENABLE_FORWARDING:-true}"
 CFWARP_HEALTHCHECK_INTERVAL="${CFWARP_HEALTHCHECK_INTERVAL:-30s}"
 
 WARP_SVC_PID=""
+WARP_IPC_SOCKET="/run/cloudflare-warp/warp_service"
+REGISTRATION_MISSING_RE='registration[[:space:]_-]*missing|registration required|not registered|no registration'
+WARP_CLI_NOT_READY_RE='unable to connect.*daemon|failed to connect.*daemon|connection refused|no such file|timed out'
 
 log() {
   printf '[cfwarp] %s\n' "$*"
@@ -100,10 +103,23 @@ start_warp_service() {
 wait_for_warp_cli() {
   local max_attempts="${1:-30}"
   local attempt=1
+  local status_output
 
   while (( attempt <= max_attempts )); do
-    if warp-cli status >/tmp/cfwarp-status.out 2>&1; then
+    if status_output="$(warp-cli status 2>&1)"; then
+      printf '%s\n' "${status_output}" >/tmp/cfwarp-status.out
       log "warp-cli is ready"
+      return 0
+    fi
+    printf '%s\n' "${status_output}" >/tmp/cfwarp-status.out
+
+    if warp_cli_status_indicates_ready "${status_output}"; then
+      log "warp-cli is ready"
+      return 0
+    fi
+
+    if [[ -S "${WARP_IPC_SOCKET}" ]]; then
+      log "warp-cli IPC socket is ready"
       return 0
     fi
 
@@ -121,6 +137,20 @@ wait_for_warp_cli() {
   die "Timed out waiting for warp-cli"
 }
 
+warp_cli_status_indicates_ready() {
+  local status="$1"
+
+  if grep -Eiq "${REGISTRATION_MISSING_RE}" <<<"${status}"; then
+    return 0
+  fi
+
+  if grep -Eiq "${WARP_CLI_NOT_READY_RE}" <<<"${status}"; then
+    return 1
+  fi
+
+  grep -Eiq 'status|connected|connecting|disconnected|unable' <<<"${status}"
+}
+
 status_text() {
   warp-cli status 2>&1 || true
 }
@@ -129,7 +159,7 @@ is_registered() {
   local status
   status="$(status_text)"
 
-  if grep -Eiq 'registration missing|registration required|not registered|no registration' <<<"${status}"; then
+  if grep -Eiq "${REGISTRATION_MISSING_RE}" <<<"${status}"; then
     return 1
   fi
 
