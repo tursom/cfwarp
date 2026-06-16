@@ -45,6 +45,54 @@ CFWARP_CONNECTOR_TOKEN=your-cloudflare-mesh-connector-token
 - `CFWARP_WARP_MODE`：默认 `warp`，用于执行 `warp-cli mode`。
 - `CFWARP_HEALTHCHECK_INTERVAL`：默认 `30s`，用于状态检查循环和日志输出节流。
 
+## Docker Compose 部署
+
+如果直接使用已发布镜像，可以在服务器上创建 `compose.yml`：
+
+```yaml
+services:
+  cfwarp:
+    image: ghcr.io/tursom/cfwarp:latest
+    container_name: cfwarp
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      CFWARP_CONNECTOR_TOKEN: ${CFWARP_CONNECTOR_TOKEN:-}
+      CFWARP_ENABLE_FORWARDING: ${CFWARP_ENABLE_FORWARDING:-true}
+      CFWARP_WARP_MODE: ${CFWARP_WARP_MODE:-warp}
+      CFWARP_HEALTHCHECK_INTERVAL: ${CFWARP_HEALTHCHECK_INTERVAL:-30s}
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    volumes:
+      - ./data/cloudflare-warp:/var/lib/cloudflare-warp
+```
+
+同目录创建 `.env`：
+
+```env
+CFWARP_CONNECTOR_TOKEN=your-cloudflare-mesh-connector-token
+CFWARP_ENABLE_FORWARDING=true
+CFWARP_WARP_MODE=warp
+CFWARP_HEALTHCHECK_INTERVAL=30s
+```
+
+启动服务：
+
+```sh
+docker compose up -d
+```
+
+查看日志和状态：
+
+```sh
+docker compose logs -f cfwarp
+docker compose exec cfwarp warp-cli status
+```
+
+`./data/cloudflare-warp` 是持久化状态目录。保留它可以让容器重启或镜像升级后复用同一个 Mesh node 注册状态，不重复注册新节点。
+
 ## 运行
 
 构建并启动：
@@ -75,18 +123,20 @@ Compose 文件会把 `./data/cloudflare-warp` 挂载到 `/var/lib/cloudflare-war
 
 ## 发布镜像
 
+项目仓库：
+
+- https://github.com/tursom/cfwarp
+
 本仓库包含 GitHub Actions workflow，会把镜像发布到 GitHub Container Registry：
 
-```sh
-ghcr.io/<owner>/<repo>
-```
+- `ghcr.io/tursom/cfwarp`
 
-需要先在 GitHub 仓库中启用 Actions。首次推送到 `main` 或 `master` 后，会生成 `latest`、分支名和 `sha-*` 标签；推送 `vX.Y.Z` 格式的 tag 后，会生成对应版本标签。
+首次推送到 `main` 或 `master` 后，会生成 `latest`、分支名和 `sha-*` 标签；推送 `vX.Y.Z` 格式的 tag 后，会生成对应版本标签。
 
 拉取示例：
 
 ```sh
-docker pull ghcr.io/<owner>/<repo>:latest
+docker pull ghcr.io/tursom/cfwarp:latest
 ```
 
 如果 GitHub Packages 中的镜像保持私有，需要先登录 GHCR，或在 Packages 设置中调整镜像可见性。
